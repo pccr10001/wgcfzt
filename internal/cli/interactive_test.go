@@ -217,3 +217,25 @@ func TestPromptReaderPreservesFollowingInput(t *testing.T) {
 		t.Fatal("buffered input lost", e)
 	}
 }
+
+func TestDeviceTableFallbackAndOfflineSelection(t *testing.T) {
+	requests := 0
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer s.Close()
+	a := &app.App{API: api.New(), Store: store.Store{Dir: t.TempDir()}}
+	a.API.BaseURL = s.URL
+	if e := a.Store.Save(&store.Profile{Name: "work", State: "ready", Protocol: "wireguard", SelectedVNetName: "cached-labs"}); e != nil {
+		t.Fatal(e)
+	}
+	out, e := runInteractive(t, a, "", "devices")
+	if e != nil || !strings.Contains(out, "API unavailable") || !strings.Contains(out, "cached-labs") || requests != 1 {
+		t.Fatal(out, e, requests)
+	}
+	out, e = runInteractive(t, a, "1\n", "status", "--offline")
+	if e != nil || requests != 1 || !strings.Contains(out, "Source: local cache") {
+		t.Fatal("offline selection contacted API", out, e, requests)
+	}
+}

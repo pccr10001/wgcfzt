@@ -44,7 +44,7 @@ func TestCLIImportStatusGenerateAndCredentialRedaction(t *testing.T) {
 	if e != nil {
 		t.Fatal(out, e)
 	}
-	for _, args := range [][]string{{"status", "--offline"}, {"generate", "--offline"}, {"devices", "list"}} {
+	for _, args := range [][]string{{"status", "--offline"}, {"generate", "--offline"}, {"devices", "list", "--offline"}} {
 		out, e = execute(t, append([]string{"--config-dir", root, "--profile", "example"}, args...)...)
 		if e != nil {
 			t.Fatal(out, e)
