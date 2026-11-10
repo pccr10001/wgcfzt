@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -12,6 +13,19 @@ import (
 	"testing"
 	"time"
 )
+
+func TestManualLoginPreservesFollowingPromptInput(t *testing.T) {
+	jwt := testJWT("example", time.Now().Add(time.Hour))
+	reader := bufio.NewReader(strings.NewReader(jwt + "\n2\n"))
+	got, e := manual(context.Background(), Options{Team: "example", Browser: "default", In: reader, Out: io.Discard, Timeout: time.Second})
+	if e != nil || got != jwt {
+		t.Fatal("manual login failed", e)
+	}
+	next, e := reader.ReadString('\n')
+	if e != nil || next != "2\n" {
+		t.Fatal("manual login consumed the following VNET choice", e)
+	}
+}
 
 func testJWT(team string, exp time.Time) string {
 	b, _ := json.Marshal(map[string]any{"iss": "https://" + team + ".cloudflareaccess.com", "exp": exp.Unix()})

@@ -162,7 +162,24 @@ func manual(ctx context.Context, o Options) (string, error) {
 		e error
 	}
 	ch := make(chan result, 1)
-	go func() { s, e := bufio.NewReader(io.LimitReader(o.In, 32769)).ReadString('\n'); ch <- result{s, e} }()
+	go func() {
+		// Reuse the CLI reader so pasted input for the following VNET prompt
+		// remains available after reading the callback.
+		reader := bufio.NewReader(o.In)
+		var input []byte
+		for {
+			part, e := reader.ReadSlice('\n')
+			if len(input)+len(part) > 32768 {
+				ch <- result{"", fmt.Errorf("JWT input too large")}
+				return
+			}
+			input = append(input, part...)
+			if e != bufio.ErrBufferFull {
+				ch <- result{string(input), e}
+				return
+			}
+		}
+	}()
 	ctx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 	select {

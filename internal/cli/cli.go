@@ -18,13 +18,39 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func New() *cobra.Command {
+func New() *cobra.Command { return newCommand(&app.App{API: api.New()}) }
+
+func newCommand(a *app.App) *cobra.Command {
 	defaultDir, _ := store.DefaultDir()
-	var dir, profile string
-	a := &app.App{API: api.New()}
+	var dir, profile, device, vnet string
+	var nonInteractive, yes, deviceChosen bool
 	root := &cobra.Command{Use: "wgcfzt", Short: "Independent Zero Trust WARP registrations, VNET selection, WireGuard and usque exports", SilenceUsage: true, SilenceErrors: true}
+	root.Example = "  wgcfzt reg\n  wgcfzt devices\n  wgcfzt vnet\n  wgcfzt vnet --device labs --vnet labs-network\n  wgcfzt device dereg --device labs --yes\n  wgcfzt config export --device labs -o labs.conf\n  wgcfzt config usque --device masque\n  wgcfzt config showkey --device labs"
 	root.PersistentFlags().StringVar(&dir, "config-dir", defaultDir, "Configuration directory")
-	root.PersistentFlags().StringVar(&profile, "profile", "default", "Named device registration")
+	root.PersistentFlags().StringVar(&profile, "profile", "default", "Device profile name (compatibility alias for --device)")
+	root.PersistentFlags().StringVar(&device, "device", "", "Device profile name or saved device ID")
+	root.PersistentFlags().StringVar(&vnet, "vnet", "", "Target VNET name or UUID")
+	root.PersistentFlags().BoolVar(&nonInteractive, "non-interactive", false, "Never prompt; use explicit device and operation flags")
+	root.PersistentFlags().BoolVar(&yes, "yes", false, "Confirm device deletion without prompting")
+	explicitDevice := func() bool {
+		return deviceChosen || root.PersistentFlags().Changed("device") || root.PersistentFlags().Changed("profile")
+	}
+	ensureDevice := func(cmd *cobra.Command, readyOnly bool) error {
+		if explicitDevice() {
+			return nil
+		}
+		if nonInteractive {
+			return fmt.Errorf("specify --device (or --profile) with --non-interactive")
+		}
+		offline, _ := cmd.Flags().GetBool("offline")
+		name, e := chooseDevice(cmd, a, readyOnly, !offline)
+		if e != nil {
+			return e
+		}
+		profile = name
+		deviceChosen = true
+		return nil
+	}
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		if dir == "" {
 			return fmt.Errorf("specify --config-dir")
@@ -34,19 +60,81 @@ func New() *cobra.Command {
 			return e
 		}
 		dir = abs
-		if e = store.ValidateName(profile); e != nil {
-			return e
-		}
 		if e = store.SecureDir(dir); e != nil {
 			return e
 		}
 		a.Store = store.Store{Dir: dir}
+		cmd.SetIn(bufio.NewReader(cmd.InOrStdin()))
+		if device != "" {
+			if root.PersistentFlags().Changed("profile") && profile != device {
+				return fmt.Errorf("use --device or --profile, not conflicting selectors")
+			}
+			if cmd.Name() == "reg" || cmd.Name() == "import" {
+				profile = device
+				if name, e := resolveDevice(a.Store, device); e == nil {
+					profile = name
+				}
+			} else {
+				profile, e = resolveDevice(a.Store, device)
+				if e != nil {
+					return e
+				}
+			}
+		}
+		if e = store.ValidateName(profile); e != nil {
+			return e
+		}
 		return nil
 	}
-	var team, protocol, deviceName, jwtFile, vnet, browser string
+	var team, protocol, deviceName, jwtFile, browser string
 	var manual, accepted, resume bool
 	var timeout time.Duration
 	reg := &cobra.Command{Use: "reg", Aliases: []string{"register", "login"}, Short: "Sign in, register a device, select a VNET, and generate its configuration", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		if nonInteractive && !explicitDevice() {
+			return fmt.Errorf("specify --device with --non-interactive")
+		}
+		interactive := !nonInteractive && (team == "" || !explicitDevice())
+		if interactive {
+			ui := newPrompts(cmd)
+			fmt.Fprintln(cmd.OutOrStdout(), "\nRegister a Zero Trust device\nEnter accepts the default; q cancels.")
+			var e error
+			if team == "" {
+				team, e = ui.line("Organization slug", suggestedTeam(a.Store))
+				if e != nil {
+					return e
+				}
+			}
+			if !explicitDevice() {
+				profile, e = ui.line("Local device name", nextDeviceName(a.Store))
+				if e != nil {
+					return e
+				}
+				if e = store.ValidateName(profile); e != nil {
+					return e
+				}
+				deviceChosen = true
+			}
+			if !cmd.Flags().Changed("protocol") && !resume {
+				i, e := ui.choose("Tunnel protocol", []string{"WireGuard profile", "MASQUE / usque JSON"}, 0)
+				if e != nil {
+					return e
+				}
+				protocol = []string{"wireguard", "masque"}[i]
+			}
+			if deviceName == "" {
+				deviceName, e = ui.line("Device display name", profile)
+				if e != nil {
+					return e
+				}
+			}
+			if !accepted {
+				fmt.Fprintln(cmd.OutOrStdout(), "Terms: https://www.cloudflare.com/application/terms/")
+				accepted, e = ui.confirm("Accept Cloudflare terms?")
+				if e != nil {
+					return e
+				}
+			}
+		}
 		if !accepted {
 			return fmt.Errorf("review https://www.cloudflare.com/application/terms/ and pass --accept-tos to register")
 		}
@@ -87,6 +175,9 @@ func New() *cobra.Command {
 		}
 		var jwt string
 		if p == nil || p.DeviceID == "" {
+			if nonInteractive && jwtFile == "" {
+				return fmt.Errorf("supply --jwt-file with --non-interactive for a new registration")
+			}
 			if jwtFile != "" {
 				var b []byte
 				if jwtFile == "-" {
@@ -112,6 +203,19 @@ func New() *cobra.Command {
 		if e != nil {
 			return e
 		}
+		if interactive && vnet == "" {
+			selector, e := chooseVNet(cmd, a, profile)
+			if e != nil {
+				return fmt.Errorf("device is registered; VNET selection ended: %w", e)
+			}
+			if _, e = a.SelectVNet(cmd.Context(), profile, selector); e != nil {
+				return e
+			}
+			p, e = a.LoadReady(profile)
+			if e != nil {
+				return e
+			}
+		}
 		path, e := a.Export(p, app.ExportOptions{MTU: 1280, Keepalive: 25})
 		if e != nil {
 			return fmt.Errorf("registration saved, configuration export failed: %w", e)
@@ -123,7 +227,6 @@ func New() *cobra.Command {
 	reg.Flags().StringVar(&protocol, "protocol", "wireguard", "wireguard or masque (usque)")
 	reg.Flags().StringVar(&deviceName, "name", "", "Device display name")
 	reg.Flags().StringVar(&jwtFile, "jwt-file", "", "Read JWT/callback from file, or - for stdin; skips browser login")
-	reg.Flags().StringVar(&vnet, "vnet", "", "Select VNET name or UUID after registration")
 	reg.Flags().StringVar(&browser, "browser", "firefox", "firefox or default")
 	reg.Flags().BoolVar(&manual, "manual", false, "Paste JWT/callback instead of taking over the URL protocol")
 	reg.Flags().BoolVar(&accepted, "accept-tos", false, "Accept Cloudflare terms for registration")
@@ -148,6 +251,9 @@ func New() *cobra.Command {
 	}})
 
 	listNetworks := func(cmd *cobra.Command, args []string) error {
+		if e := ensureDevice(cmd, true); e != nil {
+			return e
+		}
 		p, e := a.LoadReady(profile)
 		if e != nil {
 			return e
@@ -166,6 +272,9 @@ func New() *cobra.Command {
 		return nil
 	}
 	selectNetwork := func(cmd *cobra.Command, args []string) error {
+		if e := ensureDevice(cmd, true); e != nil {
+			return e
+		}
 		v, e := a.SelectVNet(cmd.Context(), profile, args[0])
 		if e != nil {
 			return e
@@ -174,16 +283,29 @@ func New() *cobra.Command {
 		return nil
 	}
 	vnets := &cobra.Command{Use: "vnet [name-or-UUID]", Short: "List VNETs, or select a VNET for this registration", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) == 0 {
+		if len(args) > 0 {
+			return selectNetwork(cmd, args)
+		}
+		if vnet != "" {
+			return selectNetwork(cmd, []string{vnet})
+		}
+		if nonInteractive {
 			return listNetworks(cmd, args)
 		}
-		return selectNetwork(cmd, args)
+		if e := ensureDevice(cmd, true); e != nil {
+			return e
+		}
+		selector, e := chooseVNet(cmd, a, profile)
+		if e != nil {
+			return e
+		}
+		return selectNetwork(cmd, []string{selector})
 	}}
 	vnets.AddCommand(&cobra.Command{Use: "list", Args: cobra.NoArgs, RunE: listNetworks})
 	vnets.AddCommand(&cobra.Command{Use: "use <name-or-UUID>", Args: cobra.ExactArgs(1), RunE: selectNetwork})
 	root.AddCommand(vnets)
 
-	var offline, genOffline bool
+	var offline bool
 	status := func(cmd *cobra.Command, name string, offline bool) error {
 		d, e := a.Store.ProfileDir(name)
 		if e != nil {
@@ -210,6 +332,12 @@ func New() *cobra.Command {
 				return e
 			}
 			p.SelectedVNet = n.Selected
+			p.SelectedVNetName = ""
+			for _, v := range n.Networks {
+				if v.ID == n.Selected {
+					p.SelectedVNetName = v.Name
+				}
+			}
 			if e = a.Store.Save(p); e != nil {
 				return e
 			}
@@ -222,111 +350,171 @@ func New() *cobra.Command {
 		}
 		return nil
 	}
-	sc := &cobra.Command{Use: "status", Short: "Check saved registration, remote key/protocol, and selected VNET", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error { return status(cmd, profile, offline) }}
+	sc := &cobra.Command{Use: "status", Short: "Check saved registration, remote key/protocol, and selected VNET", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		if e := ensureDevice(cmd, !offline); e != nil {
+			return e
+		}
+		return status(cmd, profile, offline)
+	}}
 	sc.Flags().BoolVar(&offline, "offline", false, "Show local state without contacting Cloudflare")
 	root.AddCommand(sc)
 
-	var format, output string
-	var mtu, keepalive int
-	var dns, allowed []string
-	gen := &cobra.Command{Use: "generate", Aliases: []string{"config"}, Short: "Generate a WireGuard profile or usque JSON for this registration", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		d, e := a.Store.ProfileDir(profile)
-		if e != nil {
+	makeExport := func(use, forced string) *cobra.Command {
+		var genOffline bool
+		var format, output string
+		var mtu, keepalive int
+		var dns, allowed []string
+		gen := &cobra.Command{Use: use, Short: "Generate a WireGuard profile or usque JSON for this registration", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+			if e := ensureDevice(cmd, true); e != nil {
+				return e
+			}
+			if forced != "" {
+				format = forced
+			}
+			if vnet != "" {
+				if _, e := a.SelectVNet(cmd.Context(), profile, vnet); e != nil {
+					return e
+				}
+			}
+			d, e := a.Store.ProfileDir(profile)
+			if e != nil {
+				return e
+			}
+			unlock, e := store.Lock(d)
+			if e != nil {
+				return e
+			}
+			defer unlock()
+			p, e := a.LoadReady(profile)
+			if e != nil {
+				return e
+			}
+			if !genOffline {
+				if e = a.Refresh(cmd.Context(), p); e != nil {
+					return e
+				}
+				n, e := a.API.Networks(cmd.Context(), p.AccountID, p.DeviceID, p.AccessToken)
+				if e != nil {
+					return e
+				}
+				p.SelectedVNet = n.Selected
+				p.SelectedVNetName = ""
+				for _, v := range n.Networks {
+					if v.ID == n.Selected {
+						p.SelectedVNetName = v.Name
+					}
+				}
+				if e = a.Store.Save(p); e != nil {
+					return e
+				}
+			}
+			path, e := a.Export(p, app.ExportOptions{Format: format, Output: output, MTU: mtu, Keepalive: keepalive, DNS: dns, AllowedIPs: allowed})
+			if e != nil {
+				return e
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "Configuration:", path)
+			return nil
+		}}
+		if forced == "" {
+			gen.Flags().StringVar(&format, "format", "", "wireguard or usque (defaults to profile protocol)")
+		} else if forced == "usque" {
+			gen.Short = "Export a MASQUE device as usque JSON"
+		} else {
+			gen.Short = "Export a WireGuard device configuration"
+		}
+		gen.Flags().StringVarP(&output, "output", "o", "", "Output path; default is inside the named profile")
+		gen.Flags().IntVar(&mtu, "mtu", 1280, "WireGuard MTU")
+		gen.Flags().IntVar(&keepalive, "keepalive", 25, "WireGuard keepalive in seconds, 0 disables")
+		gen.Flags().StringSliceVar(&dns, "dns", nil, "Comma-separated DNS IPs; omitted by default")
+		gen.Flags().StringSliceVar(&allowed, "allowed-ips", nil, "WireGuard CIDRs; defaults to 0.0.0.0/0,::/0")
+		gen.Flags().BoolVar(&genOffline, "offline", false, "Use cached registration without refreshing")
+		return gen
+	}
+	root.AddCommand(makeExport("generate", ""))
+	config := &cobra.Command{Use: "config", Short: "Export client configurations or explicitly reveal a private key"}
+	config.AddCommand(makeExport("export", "wireguard"), makeExport("usque", "usque"))
+	config.AddCommand(&cobra.Command{Use: "showkey", Short: "Print the selected device private key (sensitive)", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		if e := ensureDevice(cmd, true); e != nil {
 			return e
 		}
-		unlock, e := store.Lock(d)
-		if e != nil {
-			return e
-		}
-		defer unlock()
 		p, e := a.LoadReady(profile)
 		if e != nil {
 			return e
 		}
-		if !genOffline {
-			if e = a.Refresh(cmd.Context(), p); e != nil {
-				return e
-			}
-			n, e := a.API.Networks(cmd.Context(), p.AccountID, p.DeviceID, p.AccessToken)
-			if e != nil {
-				return e
-			}
-			p.SelectedVNet = n.Selected
-			if e = a.Store.Save(p); e != nil {
-				return e
-			}
+		key := p.WGPrivateKey
+		if p.Protocol == "masque" {
+			key = p.MasquePrivateKey
 		}
-		path, e := a.Export(p, app.ExportOptions{Format: format, Output: output, MTU: mtu, Keepalive: keepalive, DNS: dns, AllowedIPs: allowed})
-		if e != nil {
-			return e
-		}
-		fmt.Fprintln(cmd.OutOrStdout(), "Configuration:", path)
-		return nil
-	}}
-	gen.Flags().StringVar(&format, "format", "", "wireguard or usque (defaults to profile protocol)")
-	gen.Flags().StringVarP(&output, "output", "o", "", "Output path; default is inside the named profile")
-	gen.Flags().IntVar(&mtu, "mtu", 1280, "WireGuard MTU")
-	gen.Flags().IntVar(&keepalive, "keepalive", 25, "WireGuard keepalive in seconds, 0 disables")
-	gen.Flags().StringSliceVar(&dns, "dns", nil, "Comma-separated DNS IPs; omitted by default")
-	gen.Flags().StringSliceVar(&allowed, "allowed-ips", nil, "WireGuard CIDRs; defaults to 0.0.0.0/0,::/0")
-	gen.Flags().BoolVar(&genOffline, "offline", false, "Use cached registration without refreshing")
-	root.AddCommand(gen)
-
-	var yes bool
-	dereg := &cobra.Command{Use: "dereg", Aliases: []string{"deregister"}, Short: "Delete this remote registration and clear its local credentials", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		p, e := a.Store.Load(profile)
-		if e != nil {
-			return e
-		}
-		if !yes {
-			fmt.Fprintf(cmd.OutOrStdout(), "Delete device %s? Type the profile name (%s): ", p.DeviceID, profile)
-			s, e := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
-			if e != nil && s == "" {
-				return e
-			}
-			if strings.TrimSpace(s) != profile {
-				return fmt.Errorf("deletion cancelled")
-			}
-		}
-		if e = a.Deregister(cmd.Context(), profile); e != nil {
-			return e
-		}
-		fmt.Fprintln(cmd.OutOrStdout(), "Device registration deleted; local credentials cleared. External configuration copies are not removed.")
-		return nil
-	}}
-	dereg.Flags().BoolVar(&yes, "yes", false, "Confirm deletion without prompting")
-	root.AddCommand(dereg)
-
-	devices := &cobra.Command{Use: "devices", Short: "Manage device registrations owned by local profiles"}
-	devices.AddCommand(&cobra.Command{Use: "list", Short: "List local profiles without exposing credentials", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		entries, e := os.ReadDir(filepath.Join(dir, "profiles"))
-		if os.IsNotExist(e) {
-			return nil
-		}
-		if e != nil {
-			return e
-		}
-		for _, x := range entries {
-			if !x.IsDir() {
-				continue
-			}
-			p, e := a.Store.Load(x.Name())
-			if e != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Cannot load profile %s\n", x.Name())
-				continue
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\t%s\n", p.Name, p.Team, p.Protocol, p.State, p.DeviceID)
-		}
+		fmt.Fprintln(cmd.OutOrStdout(), key)
 		return nil
 	}})
+	root.AddCommand(config)
+
+	makeDereg := func() *cobra.Command {
+		dereg := &cobra.Command{Use: "dereg", Aliases: []string{"deregister"}, Short: "Delete this remote registration and clear its local credentials", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+			if e := ensureDevice(cmd, false); e != nil {
+				return e
+			}
+			p, e := a.Store.Load(profile)
+			if e != nil {
+				return e
+			}
+			if !yes {
+				if nonInteractive {
+					return fmt.Errorf("deletion requires --yes with --non-interactive")
+				}
+				answer, e := newPrompts(cmd).line(fmt.Sprintf("Delete device %s? Type local name %s", display(p.DeviceID), profile), "")
+				if e != nil {
+					return e
+				}
+				if answer != profile {
+					return errCancelled
+				}
+			}
+			if e = a.Deregister(cmd.Context(), profile); e != nil {
+				return e
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "Device registration deleted; local credentials cleared. External configuration copies are not removed.")
+			return nil
+		}}
+		return dereg
+	}
+	root.AddCommand(makeDereg())
+
+	var devicesOffline bool
+	listDevices := func(cmd *cobra.Command, args []string) error {
+		rows, e := deviceRows(cmd.Context(), a, !devicesOffline)
+		if e != nil {
+			return e
+		}
+		printDevices(cmd, rows)
+		return nil
+	}
+	devices := &cobra.Command{Use: "devices", Aliases: []string{"device"}, Short: "List and manage locally owned devices and their selected VNETs", Args: cobra.NoArgs, RunE: listDevices}
+	devices.PersistentFlags().BoolVar(&devicesOffline, "offline", false, "Show cached device and VNET state")
+	devices.AddCommand(&cobra.Command{Use: "list", Short: "List devices and selected VNETs", Args: cobra.NoArgs, RunE: listDevices})
+	devices.AddCommand(makeDereg())
 	devices.AddCommand(&cobra.Command{Use: "show [profile]", Short: "Fetch live status for a locally managed device", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		name := profile
 		if len(args) > 0 {
-			name = args[0]
+			var e error
+			name, e = resolveDevice(a.Store, args[0])
+			if e != nil {
+				return e
+			}
 		}
-		return status(cmd, name, false)
+		if len(args) == 0 {
+			if e := ensureDevice(cmd, true); e != nil {
+				return e
+			}
+			name = profile
+		}
+		return status(cmd, name, devicesOffline)
 	}})
-	devices.AddCommand(&cobra.Command{Use: "rename <display-name>", Short: "Rename the device selected by --profile", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	devices.AddCommand(&cobra.Command{Use: "rename <display-name>", Short: "Rename a device selected interactively or with --device", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if e := ensureDevice(cmd, true); e != nil {
+			return e
+		}
 		if len(args[0]) == 0 || len(args[0]) > 128 {
 			return fmt.Errorf("device name must be 1-128 bytes")
 		}
@@ -413,5 +601,16 @@ func New() *cobra.Command {
 	imp.Flags().StringVar(&keyFile, "key-file", "", "Base64 private key file or JSON with private_key")
 	imp.Flags().StringVar(&importTeam, "team", "", "Organization slug")
 	root.AddCommand(imp)
+	root.AddGroup(&cobra.Group{ID: "registration", Title: "Registration:"}, &cobra.Group{ID: "management", Title: "Devices and networks:"}, &cobra.Group{ID: "configuration", Title: "Configuration:"})
+	for _, c := range root.Commands() {
+		switch c.Name() {
+		case "reg", "import", "recover":
+			c.GroupID = "registration"
+		case "devices", "status", "vnet", "dereg":
+			c.GroupID = "management"
+		case "config", "generate":
+			c.GroupID = "configuration"
+		}
+	}
 	return root
 }

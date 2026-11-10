@@ -1,31 +1,34 @@
-# 驗證紀錄
+# Validation evidence and limits
 
-實測日期：2026-11-10。測試識別碼、組織名稱與憑證不放入版本庫。
+Validation date: 2026-11-10. Credentials, organization identifiers and real private network details are intentionally excluded from this repository.
 
-## 已完成
+## Completed integration checks
 
-| 項目 | 證據 |
+| Check | Evidence |
 | --- | --- |
-| Windows 原生 callback dispatch | 以真正 `com.cloudflare.warp://` dispatch 將合成 JWT 傳入 executable，再透過 localhost 回到測試程序 |
-| 協定還原 | 測試比對接管前後 HKCU registry 樹，以及 OS 有效 handler command |
-| 逾時／還原失敗 | 自動測試證明逾時執行還原，還原失敗不回傳 JWT 給註冊流程 |
-| 原有註冊匯入 | 實際匯入既有 WG 金鑰與註冊回應，成功線上 GET 狀態及 VNET |
-| 新 WireGuard 註冊 | 透過 Go CLI 建立一次性測試裝置，回應公鑰與本機相符 |
-| 真實登入 JWT callback | 從授權的瀏覽器 session 取得成功頁結果，透過暫時 native handler 送回 Go CLI 並完成註冊 |
-| WireGuard 握手 | 以不建立 OS 網卡的 userspace netstack 對回傳 peer 完成 authenticated handshake |
-| VNET | Go CLI 以名稱切換非預設 VNET，GET 讀回正確 UUID，之後可切回預設 |
-| 裝置改名 | PATCH 改名後，GET 註冊回應確認新名稱 |
-| 解除註冊 | Go CLI 對一次性測試裝置執行 DELETE 成功，清除其本機金鑰／Token／預設 profile |
-| MASQUE 註冊與匯出 | 新建獨立 P-256 MASQUE 註冊，匯出 usque JSON |
-| 原版 usque 可直接使用 | 未修改的 usque 載入 JSON，成功連上 MASQUE；經 localhost HTTP proxy 的公開 trace 請求回傳 HTTP 200、`warp=on`、`gateway=on` |
-| usque 與非預設 VNET | 使用 Go CLI 將 MASQUE 註冊切換到非預設 VNET並讀回，重開 usque 後公開 trace 同樣成功；測試後還原預設 VNET |
+| Windows native callback | Actual `com.cloudflare.warp://` dispatch delivered a synthetic JWT through the executable to authenticated localhost IPC |
+| Association restoration | Compared HKCU registry state and effective Windows handler before and after dispatch |
+| Failure handling | Automated timeout/restoration-failure tests verify cleanup and withholding of tokens |
+| Existing WG import | Imported a matching registration and key, then queried live status and VNETs |
+| Fresh WG registration | Go CLI created a throwaway registration and matched the returned public key |
+| WireGuard connectivity | Isolated userspace netstack completed an authenticated peer handshake without installing OS routes |
+| VNET switching | CLI selected a nondefault VNET, read back the expected UUID, and restored default |
+| Device rename | PATCH followed by GET confirmed the display name |
+| Deregistration | CLI DELETE succeeded for the throwaway registration and cleared its local credentials |
+| MASQUE configuration | Created a separate P-256 registration and exported usque JSON |
+| Original usque compatibility | Unmodified usque loaded the JSON; a local HTTP proxy trace request returned HTTP 200, `warp=on` and `gateway=on` |
+| MASQUE with nondefault VNET | Selected a nondefault VNET, restarted usque, confirmed the public trace, and restored default |
 
-測試過程不啟動官方 WARP app 的註冊登入，也不啟用 OS 全通路由。
+These checks did not log into the original WARP app or activate a system-wide default route. Browser SSO output was also exercised independently of the native callback path. Initial browser login can time out when the browser has not dispatched the callback; that case restored the association correctly.
 
-## 驗證範圍
+## Automated CLI coverage
 
-瀏覽器可能要求使用者按下成功頁 callback 按鈕、確認開啟 wgcfzt，或因瀏覽器 handler 設定而需要手貼。原生 dispatch 成功不代表每種瀏覽器政策都會允許無提示跳轉。曾觀察到瀏覽器未送出 callback 而正常逾時，工具完成協定還原。
+Tests exercise bare interactive registration through configuration export, the shared input reader, selecting the correct device/token for VNET switching, direct selectors without menus, device tables with VNET names, cancellation and confirmation of deletion, explicit key display, export aliases, protocol mismatch rejection and grouped help. Existing app/auth/store tests cover lifecycle and recovery behavior. See [development instructions](DEVELOPMENT.md) for commands.
 
-WireGuard／MASQUE 握手與公開 HTTP 請求不能證明某個 VNET 私網服務可達。尚待使用者指定私網 IP／主機／port，驗證私網路由、組織 DNS、Gateway 政策與重疊 IP 的 VNET 隔離。
+## Verification boundaries
 
-尚未驗證保留同一 device ID 的 Registration Token refresh／rotation、既有隧道即時套用 VNET 的時間、所有組織的裝置數量限制，以及 Windows 以外的自動協定接管。非 Windows 平台目前走手貼。
+A successful handshake or public HTTP trace does not prove private destination reachability, VNET isolation, private DNS, or policy behavior for a particular application. No specific private IP/hostname/port was supplied for this validation. Test these separately for each intended network.
+
+Native dispatch confirms OS handler invocation; real browser choices may still require a confirmation button or explicit handler selection. Windows UserChoice and Firefox preferences can prevent automatic dispatch and require manual fallback. Linux/macOS currently use manual login rather than native handler takeover.
+
+Same-device registration-token refresh/rotation, token lifetime, immediate termination of established sessions after deregistration, and long-term enrollment expiry have not been established. Separate registrations provide independent VNET state; simultaneous tunnel/proxy behavior also depends on the client and local routing configuration.

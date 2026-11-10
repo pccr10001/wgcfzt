@@ -187,6 +187,11 @@ func (a *App) Register(ctx context.Context, o RegisterOptions) (*store.Profile, 
 			return nil, fmt.Errorf("registration saved; listing VNETs failed: %w", e)
 		}
 		p.SelectedVNet = n.Selected
+		for _, v := range n.Networks {
+			if v.ID == n.Selected {
+				p.SelectedVNetName = v.Name
+			}
+		}
 		if e = a.Store.Save(p); e != nil {
 			return nil, e
 		}
@@ -253,6 +258,7 @@ func (a *App) selectVNet(ctx context.Context, p *store.Profile, selector string)
 		return v, fmt.Errorf("VNET readback did not match selection")
 	}
 	p.SelectedVNet = v.ID
+	p.SelectedVNetName = v.Name
 	return v, a.Store.Save(p)
 }
 func (a *App) SelectVNet(ctx context.Context, name, selector string) (api.Network, error) {

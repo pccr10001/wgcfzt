@@ -24,6 +24,7 @@ type Profile struct {
 	WGPrivateKey     string           `json:"wireguard_private_key,omitempty"`
 	MasquePrivateKey string           `json:"masque_private_key,omitempty"`
 	SelectedVNet     string           `json:"selected_vnet,omitempty"`
+	SelectedVNetName string           `json:"selected_vnet_name,omitempty"`
 	Updated          time.Time        `json:"updated_at"`
 	Registration     api.Registration `json:"registration"`
 }
