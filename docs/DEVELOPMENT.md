@@ -27,6 +27,8 @@ The parent snapshots the current-user `HKCU\Software\Classes\com.cloudflare.warp
 
 The handler command includes `callback -- "%1"`; the separator prevents URL content from becoming CLI flags. Session data contains a loopback URL, random nonce and team slug, not a saved JWT. The helper validates the token and posts to the exact loopback URL with the nonce. Its HTTP transport uses no proxy and follows no redirects. On HTTP 204 it returns and the process exits, while the parent continues.
 
+The executable disables Cobra's Windows Explorer launch guard. Browser callbacks can be brokered by Explorer; the default guard would show a cmd.exe instruction and exit before delivering the token. Ordinary native dispatch from a test runner does not reproduce that parent-process condition.
+
 `auth.Login` restores the association before returning the JWT. Restoration failure withholds the JWT from the registration layer. Timeout, cancellation and ordinary completion all restore. Force-kill cannot execute deferred cleanup; a protected backup enables `recover`, and any pending backup blocks subsequent registrations.
 
 Restoration compares ownership before changing values, restores the tree in place, and records a checkpoint for interrupted restoration. External handler changes are reported instead of overwritten. Existing keys retain their ACLs where possible. Backups are removed only after successful restoration.
@@ -65,6 +67,16 @@ $env:WGCFZT_PROTOCOL_TEST_DIR = "$env:LOCALAPPDATA\wgcfzt-callback-test"
 go test ./internal/auth -run TestWindowsNativeCallbackRoundtrip -v
 Remove-Item Env:WGCFZT_PROTOCOL_TEST_EXE
 Remove-Item Env:WGCFZT_PROTOCOL_TEST_DIR
+```
+
+To reproduce browser callbacks brokered by Explorer, run this separate opt-in regression with the built executable. It starts a hidden helper with Explorer as its parent and checks token delivery and successful process exit. It uses a synthetic token and a temporary loopback session, and does not change the protocol association:
+
+```powershell
+$env:WGCFZT_PROTOCOL_TEST_EXE = (Resolve-Path .\dist\wgcfzt.exe).Path
+$env:WGCFZT_EXPLORER_PID = (Get-Process explorer | Select-Object -First 1).Id.ToString()
+go test ./internal/auth -run TestWindowsExplorerParentCallback -v
+Remove-Item Env:WGCFZT_PROTOCOL_TEST_EXE
+Remove-Item Env:WGCFZT_EXPLORER_PID
 ```
 
 If restoration fails, retain the test directory and run `recover` using that directory before another login. Never delete a pending backup to suppress recovery checks.
