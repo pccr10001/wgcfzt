@@ -45,6 +45,11 @@ func Login(ctx context.Context, o Options) (token string, err error) {
 	if err != nil {
 		return "", err
 	}
+	if _, e := os.Stat(filepath.Join(o.Dir, "protocol-backup.json")); e == nil {
+		return "", fmt.Errorf("run wgcfzt recover before logging in: %w", ErrRecoveryRequired)
+	} else if !errors.Is(e, os.ErrNotExist) {
+		return "", e
+	}
 	if o.Manual {
 		return manual(ctx, o)
 	}

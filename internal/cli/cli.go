@@ -59,6 +59,11 @@ func New() *cobra.Command {
 		if protocol != "wireguard" && protocol != "masque" {
 			return fmt.Errorf("--protocol must be wireguard or masque")
 		}
+		if _, e := os.Stat(filepath.Join(dir, "protocol-backup.json")); e == nil {
+			return fmt.Errorf("a temporary protocol handler is still pending; finish that login or run wgcfzt recover before registration")
+		} else if !errors.Is(e, os.ErrNotExist) {
+			return e
+		}
 		p, e := a.Store.Load(profile)
 		if e == nil && !resume {
 			return fmt.Errorf("profile exists; choose another --profile or --resume")
